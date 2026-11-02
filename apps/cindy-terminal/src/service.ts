@@ -343,11 +343,14 @@ export class TerminalService {
       if(!current())return;
       await tasks.unlockSecretServices();if(!current())return;
       await plugins!.start();if(!current())return;
+      // A disposable executor cannot announce readiness while its first catalog
+      // refresh can still invalidate the route of an immediately queued input.
+      if (this.runtimePaths.executionHost) { await this.startGateway(); if (!current()) return; }
       await tasks.resumePending();if(!current())return;
       if(!companionCloud)await companions?.resumePending();if(!current())return;
       await routines?.open();if(!current())return;
       await scheduler.activate();if(!current())return;
-      this.startGateway();
+      if (!this.runtimePaths.executionHost) void this.startGateway();
       void im?.start().catch(()=>{if(current())logger.warn('IM_CONNECTION_START_FAILED');});
     });
     this.ownerActivation=pending;
@@ -356,7 +359,7 @@ export class TerminalService {
   }
   private startGateway() {
     const gateway = this.gateway;
-    void gateway?.start().catch(() => { if (!this.closing && gateway === this.gateway) logger.warn('MODEL_ACCESS_REFRESH_FAILED'); });
+    return gateway?.start().catch(() => { if (!this.closing && gateway === this.gateway) logger.warn('MODEL_ACCESS_REFRESH_FAILED'); });
   }
   /** Account authority is already revoked before this runs. Cleanup failures
    * cannot skip later owners' private sockets, native tasks or durable stores. */

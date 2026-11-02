@@ -12,7 +12,7 @@
  * passphrase, a second host, or an unauthenticated pipe client. Tier: integration
  * because the test uses a private temporary directory and actual local sockets.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -31,7 +31,9 @@ import { TerminalMediaTransfer } from './media-transfer.js';
 import { TerminalSecretStore } from './secrets.js';
 import { TerminalTransportServer, connectTerminal } from './transport.js';
 import { TerminalService } from './service.js';
-import { LiteExecution } from './lite-execution.js';
+import { LiteExecution, liteProfileVersion } from './lite-execution.js';
+import { TerminalGateway } from './models/gateway.js';
+import { TerminalAuthController } from '@cindy/auth-client';
 import { socketPath, privateDirectory, windowsSystemCommand, windowsPowerShellEnv } from './platform.js';
 import { TerminalProtectedInput } from './protected-input.js';
 import { TerminalConfiguration } from './configuration.js';
@@ -99,6 +101,146 @@ it('recycles the lite executor while preserving reads and rejecting unsafe shutd
     await expect(pool.invoke('terminal:tasks:list', [])).rejects.toThrow('LITE_RESIDENT_STOPPING');
   } finally { await pool.close(); await fs.rm(root, { recursive: true, force: true }); }
 });
+
+// Integration: a crash after a cached read used to serve that old projection
+// indefinitely. Real fork/IPC, minimal read -> crash -> read, no request replay.
+it('discards lite snapshots after executor failure and recovers on a new read', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cindy-lite-crash-'));
+  const file = path.join(root, 'executor.mjs');
+  await fs.writeFile(file, `
+    import {spawn} from 'node:child_process';
+    let engine;
+    process.on('message',m=>{
+      if(m.type==='init'){process.send({type:'ready'});return;}
+      if(m.type!=='invoke')return;
+      if(m.args[0]==='crash'){process.exit(7);return;}
+      if(m.channel==='lite:drain'){
+        const done=()=>process.send({type:'result',id:m.id,value:{closed:true}},()=>process.exit(0));
+        if(engine){engine.once('exit',done);engine.kill();}else done();return;
+      }
+      if(process.platform==='linux'&&!engine)engine=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+      process.send({type:'result',id:m.id,value:m.channel==='terminal:status'?{busy:false}:{pid:process.pid,engine:engine?.pid}});
+    });
+    process.on('disconnect',()=>process.exit(0));
+  `);
+  const pool = new LiteExecution({ file, profile: root, region: 'global', auth: () => ({}), refresh: async () => ({}), push() {}, idleMs: 0 });
+  try {
+    const first = await pool.invoke('terminal:tasks:list', []) as { pid: number; engine?: number };
+    await expect(pool.invoke('terminal:tasks:list', ['crash'])).rejects.toThrow('EXECUTOR_EXITED_OUTCOME_UNKNOWN');
+    if (first.engine) await vi.waitFor(async () => {
+      const state = await fs.readFile(`/proc/${first.engine}/stat`, 'utf8').catch(() => '');
+      expect(!state || state.slice(state.lastIndexOf(')') + 2).startsWith('Z')).toBe(true);
+    }, { interval: 5 });
+    expect(await pool.invoke('terminal:tasks:list', [])).not.toEqual(first);
+    expect(pool.state.starts).toBe(2);
+  } finally { await pool.close(); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+// Integration: production cache must not return an earlier small value after
+// an oversized replacement, an external profile edit, or expiry. Old fixture
+// covered only writes routed through the pool; this one uses a real disk stamp.
+it('bounds lite cache freshness and drops oversized replacements', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cindy-lite-cache-'));
+  const file = path.join(root, 'executor.mjs'), valueFile = path.join(root, 'value.json');
+  await fs.writeFile(valueFile, JSON.stringify('first'));
+  await fs.writeFile(file, `
+    import {readFileSync} from 'node:fs';
+    process.on('message',m=>{
+      if(m.type==='init'){process.send({type:'ready'});return;}
+      if(m.type!=='invoke')return;
+      if(m.channel==='lite:drain'){process.send({type:'result',id:m.id,value:{}},()=>process.exit(0));return;}
+      process.send({type:'result',id:m.id,value:m.channel==='terminal:status'?{busy:false}:JSON.parse(readFileSync(${JSON.stringify(valueFile)},'utf8'))});
+    });
+    process.on('disconnect',()=>process.exit(0));
+  `);
+  const options = { file, profile: root, region: 'global', auth: () => ({}), refresh: async () => ({}), push() {}, idleMs: 0, cacheMs: 300_000,
+    cacheVersion: () => liteProfileVersion(root, 'fixture') };
+  const pool = new LiteExecution(options);
+  try {
+    expect(await pool.invoke('terminal:tasks:list', [])).toBe('first');
+    const large = 'x'.repeat(600_000);
+    await fs.writeFile(valueFile, JSON.stringify(large));
+    expect(await pool.invoke('terminal:tasks:list', [])).toBe(large);
+    await pool.idle();
+    expect(pool.state.cacheEntries).toBe(0);
+    await fs.writeFile(valueFile, JSON.stringify('second'));
+    expect(await pool.invoke('terminal:tasks:list', [])).toBe('second');
+    await pool.idle();
+    expect(await pool.invoke('terminal:tasks:list', [])).toBe('second');
+    expect(pool.state.starts).toBe(2);
+    await fs.writeFile(valueFile, JSON.stringify('external replacement'));
+    expect(await pool.invoke('terminal:tasks:list', [])).toBe('external replacement');
+    expect(pool.state.starts).toBe(3);
+    options.cacheMs = 0;
+    await pool.idle();
+    expect(await pool.invoke('terminal:tasks:list', [])).toBe('external replacement');
+    expect(pool.state.starts).toBe(4);
+  } finally { await pool.close(); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+// Integration: a failed or silent init previously left a permanently rejected
+// or unresolved starting promise. Timed-out writes must not be replayed; an
+// already-aborted request must never reach the child. Small real fork deadlines
+// are the production failure inputs; no >=100ms sleep or polling is used.
+it('recovers lite startup failure and cancels requests without replaying writes', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cindy-lite-fault-'));
+  const file = path.join(root, 'executor.mjs'), record = path.join(root, 'writes');
+  const options = { file, profile: root, region: 'global', auth: () => ({}), refresh: async () => ({}), push() {}, idleMs: 0, startupMs: 25, requestMs: 25 };
+  const pool = new LiteExecution(options);
+  try {
+    await fs.writeFile(file, "process.on('message',()=>{});");
+    await expect(pool.invoke('terminal:tasks:list', [])).rejects.toThrow('EXECUTOR_START_TIMEOUT');
+    expect(pool.state.executorPid).toBeNull();
+    options.startupMs = 120_000;
+    await fs.writeFile(file, "process.on('message',()=>process.send({type:'startup-error',code:'FIXTURE_START_FAILED'}));");
+    await expect(pool.invoke('terminal:tasks:list', [])).rejects.toThrow('FIXTURE_START_FAILED');
+    expect(pool.state.executorPid).toBeNull();
+    await fs.writeFile(file, `
+      import {appendFileSync} from 'node:fs';
+      process.on('message',m=>{
+        if(m.type==='init'){process.send({type:'ready'});return;}
+        if(m.type!=='invoke')return;
+        if(m.channel==='write'){appendFileSync(${JSON.stringify(record)},'once');return;}
+        if(m.channel==='lite:drain'){process.send({type:'result',id:m.id,value:{}},()=>process.exit(0));return;}
+        process.send({type:'result',id:m.id,value:{busy:false}});
+      });
+      process.on('disconnect',()=>process.exit(0));
+    `);
+    await expect(pool.invoke('write', [])).rejects.toThrow('EXECUTOR_TIMEOUT_OUTCOME_UNKNOWN');
+    expect(await fs.readFile(record, 'utf8')).toBe('once');
+    options.requestMs = 120_000;
+    const controller = new AbortController(); controller.abort();
+    await expect(pool.invoke('write', [], { source: 'local', signal: controller.signal })).rejects.toThrow('INVOCATION_CANCELLED');
+    expect(await pool.invoke('terminal:tasks:list', [])).toEqual({ busy: false });
+    expect(await fs.readFile(record, 'utf8')).toBe('once');
+    await pool.idle(); expect(pool.state.executorPid).toBeNull();
+  } finally { await pool.close(); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+// Integration: VPS cold execution raced the first model catalog refresh.
+// Hold that refresh through the real service.start entry; neither pending queue
+// recovery nor the child-ready boundary may precede the initial model snapshot.
+it('awaits initial model refresh before a lite executor is ready', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cindy-lite-ready-'));
+  const secrets = new TerminalSecretStore(root);
+  await secrets.open(); await secrets.initialize('machine');
+  let release!: () => void, entered!: () => void;
+  const refresh = new Promise<void>(resolve => { release = resolve; });
+  const refreshing = new Promise<void>(resolve => { entered = resolve; });
+  const gateway = vi.spyOn(TerminalGateway.prototype, 'start').mockImplementation(async () => { entered(); await refresh; });
+  const service = new TerminalService(root, 'global', { worktreeAppDataRoot: path.join(root, 'worktrees'), executionHost: {
+    secrets, transport: { async listen() {}, async close() {}, publish() {} }, createAuth: options => new TerminalAuthController(options),
+  } });
+  let settled = false;
+  const starting = service.start().then(() => { settled = true; });
+  try {
+    await refreshing; await new Promise<void>(resolve => setImmediate(resolve));
+    expect(settled).toBe(false);
+    release(); await starting;
+    expect(await service.invoke('terminal:status', [], { source: 'local' })).toMatchObject({ busy: false });
+    expect(gateway).toHaveBeenCalledTimes(1);
+  } finally { release(); await starting.catch(() => {}); await service.close(); gateway.mockRestore(); await fs.rm(root, { recursive: true, force: true }); }
+}, process.platform === 'win32' ? 30_000 : 5_000);
 
 // Integration: the original media service was absent from the Node host. A
 // configured image connection must execute, persist and recover its real blob;

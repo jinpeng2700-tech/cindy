@@ -12,7 +12,7 @@ let closing = false;
 let authId = 0;
 const refreshes = new Map<number, { resolve(value: TerminalAuthSnapshot): void; reject(error: Error): void }>();
 const requests = new Map<string, AbortController>();
-const send = (value: unknown) => process.send?.(value as object);
+const send = (value: unknown) => { if (process.connected) process.send?.(value as object, () => {}); };
 const code = (error: unknown) => error instanceof Error && error.message.startsWith('UNSUPPORTED_CHANNEL:') ? 'UNSUPPORTED_CHANNEL'
   : error instanceof Error && /^[A-Z_]{3,80}$/.test(error.message) ? error.message : 'EXECUTOR_OPERATION_FAILED';
 
@@ -50,7 +50,10 @@ process.on('message', (message: any) => {
       },
     } });
     ready = service.start();
-    void ready.then(() => send({ type: 'ready' }), error => { send({ type: 'startup-error', code: code(error) }); process.exitCode = 1; });
+    void ready.then(() => send({ type: 'ready' }), error => {
+      send({ type: 'startup-error', code: code(error) });
+      void service.close().catch(() => {}).finally(() => process.exit(1));
+    });
     return;
   }
   if (message.type === 'auth-result') {
@@ -72,7 +75,8 @@ process.on('message', (message: any) => {
       if (status.busy || requests.size !== 1) throw new Error('EXECUTOR_BUSY');
       closing = true;
       await service.close();
-      process.send?.({ type: 'result', id: message.id, value: { closed: true } }, () => process.exit(0));
+      if (process.connected) process.send?.({ type: 'result', id: message.id, value: { closed: true } }, () => process.exit(0));
+      else process.exit(0);
       return;
     }
     const value = await service.invoke(message.channel, message.args, context);
@@ -82,7 +86,9 @@ process.on('message', (message: any) => {
     .finally(() => requests.delete(message.id));
 });
 process.on('disconnect', () => {
+  closing = true;
   for (const controller of requests.values()) controller.abort();
   for (const pending of refreshes.values()) pending.reject(new Error('RESIDENT_DISCONNECTED'));
-  void ready?.then(() => service.close()).finally(() => process.exit(1));
+  refreshes.clear();
+  void Promise.resolve(ready).catch(() => {}).then(() => service?.close()).catch(() => {}).finally(() => process.exit(1));
 });

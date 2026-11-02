@@ -8,7 +8,7 @@ import { TerminalSecretStore } from './secrets.js';
 import { TerminalTransportServer } from './transport.js';
 import { TerminalDeviceService } from './remote/service.js';
 import { TerminalDeviceManagement } from './remote/management.js';
-import { LiteExecution } from './lite-execution.js';
+import { LiteExecution, liteProfileVersion } from './lite-execution.js';
 import type { InvocationContext } from './contracts.js';
 import { VERSION } from './version.js';
 import globalEndpoints from '../../../config/endpoint.global.json';
@@ -39,9 +39,9 @@ export async function startLiteResident(profile: string, region: AuthRegion) {
   const authState = () => { check(); return { snapshot: auth.snapshot(), token: auth.getAccessToken() }; };
   const close = async () => {
     if (closing) return;
-    if (await pool.busy()) throw new Error('STOP_RUNNING_TASKS_BEFORE_SERVICE_STOP');
     closing = true;
-    await pool.close(); clearInterval(refreshTimer);
+    try { await pool.close(); } catch (error) { closing = false; throw error; }
+    clearInterval(refreshTimer);
     management.close(); remote.stop(); await auth.cancel();
     await secrets.flush(); secrets.lock(); await transport.close();
   };
@@ -55,7 +55,7 @@ export async function startLiteResident(profile: string, region: AuthRegion) {
       prototype: { ...pool.state, memory: process.memoryUsage(), channels: Object.fromEntries(counts), failures: Object.fromEntries(failures), controllers: remote.activeControllers() } };
     if (channel === 'terminal:service:stop') {
       if (await pool.busy()) throw new Error('STOP_RUNNING_TASKS_BEFORE_SERVICE_STOP');
-      setImmediate(() => { void close().then(() => process.exit(0)); }); return { stopping: true };
+      setImmediate(() => { void close().then(() => process.exit(0), () => { /* A new task won the stop race; keep serving. */ }); }); return { stopping: true };
     }
     // Configuration/credential mutation and cross-account hosting are outside
     // this opt-in prototype; the normal service remains the full implementation.
@@ -85,6 +85,7 @@ export async function startLiteResident(profile: string, region: AuthRegion) {
     active = !!owner && auth.snapshot().session?.status === 'authenticated'; check();
     pool = new LiteExecution({ file: path.join(path.dirname(fileURLToPath(import.meta.url)), 'lite-executor.js'), profile, region,
       auth: authState, refresh: async () => { await auth.refresh(); return authState(); },
+      cacheVersion: () => liteProfileVersion(profile, owner!),
       push(channel, args) {
         if (!active || closing) return;
         transport.publish(channel, args); void remote?.publish(channel, args[0]).catch(() => {});
