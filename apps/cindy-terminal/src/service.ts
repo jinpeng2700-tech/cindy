@@ -96,7 +96,7 @@ function object(value: unknown): Record<string, unknown> { if (!value || typeof 
 export class TerminalService {
   readonly settings: SettingsStore;
   readonly secrets: TerminalSecretStore;
-  readonly transport: TerminalTransportServer;
+  readonly transport: Pick<TerminalTransportServer, 'listen' | 'publish' | 'close'>;
   readonly manager: TerminalServiceManager;
   private auth!: TerminalAuthController;
   private remote!: TerminalDeviceService;
@@ -155,13 +155,19 @@ export class TerminalService {
   readonly stopped = new Promise<void>(resolve => { this.stopWait = resolve; });
   private closing?: Promise<void>;
 
-  constructor(readonly profileDir: string, readonly region: AuthRegion = 'global', private readonly runtimePaths: { worktreeAppDataRoot?: string; createDesktopPlatform?: CreateTerminalDesktopPlatform; directRuntime?: DirectRuntime; createFilePeerRuntime?: TerminalFilePeerOptions['createRuntime']; desktopHost?: TerminalHostCommand } = {}) {
+  constructor(readonly profileDir: string, readonly region: AuthRegion = 'global', private readonly runtimePaths: { worktreeAppDataRoot?: string; createDesktopPlatform?: CreateTerminalDesktopPlatform; directRuntime?: DirectRuntime; createFilePeerRuntime?: TerminalFilePeerOptions['createRuntime']; desktopHost?: TerminalHostCommand;
+    executionHost?: {
+      transport: Pick<TerminalTransportServer, 'listen' | 'publish' | 'close'>;
+      secrets: TerminalSecretStore;
+      createAuth(options: ConstructorParameters<typeof TerminalAuthController>[0]): TerminalAuthController;
+    };
+  } = {}) {
     this.pluginBrowser=new TerminalBrowserRuntime({root:path.join(profileDir,'browser-runtime'),changed:status=>this.transport?.publish('terminal:browser:status',[status])});
     this.settings = new SettingsStore(profileDir);
-    this.secrets = new TerminalSecretStore(profileDir);
+    this.secrets = runtimePaths.executionHost?.secrets ?? new TerminalSecretStore(profileDir);
     this.engines = new EngineManager({ profileDir, onProgress: progress => this.transport?.publish('terminal:engines:progress', [progress]) });
     this.manager = new TerminalServiceManager(profileDir,path.join(RUNTIME_DIRECTORY,'cli.js'),terminalNodeExecutable(),{desktopHost:runtimePaths.desktopHost});
-    this.transport = new TerminalTransportServer(profileDir, async (channel,args,deviceId) => {
+    this.transport = runtimePaths.executionHost?.transport ?? new TerminalTransportServer(profileDir, async (channel,args,deviceId) => {
       await this.init;
       if (deviceId) {
         if (channel.startsWith('terminal:')&&channel!==REMOTE_TERMINAL_CHANNEL) throw new Error('LOCAL_COMMAND_REQUIRES_LOCAL_TARGET');
@@ -187,7 +193,7 @@ export class TerminalService {
   }
   private async initialize() {
     await this.settings.open(); await this.secrets.open();
-    this.auth = new TerminalAuthController({
+    this.auth = (this.runtimePaths.executionHost?.createAuth ?? (options => new TerminalAuthController(options)))({
       deviceId:this.settings.deviceId, region:this.region, locale:this.settings.snapshot().effective.language, fetch,
       endpoints:{global:{baseUrl:globalEndpoints.authApiBaseUrl,hostedCallbackUrl:globalEndpoints.authDesktopCallbackUrl},cn:{baseUrl:chinaEndpoints.authApiBaseUrl,hostedCallbackUrl:chinaEndpoints.authDesktopCallbackUrl}},
       secretStore:{
@@ -306,11 +312,11 @@ export class TerminalService {
     if(!this.secrets.status().locked)await this.auth.initialize();
     await this.ownerChange;
     await this.activateOwner();
-    this.refreshTimer=setInterval(()=>{
+    if (!this.runtimePaths.executionHost) this.refreshTimer=setInterval(()=>{
       const flow=this.auth.snapshot().flow;
       if(!this.secrets.status().locked && (!flow || flow.step==='completed'))void this.auth.refresh().catch(()=>logger.warn('AUTH_REFRESH_FAILED'));
     },5*60_000);
-    this.refreshTimer.unref();
+    this.refreshTimer?.unref();
   }
 
   private async syncOwner(snapshot: TerminalAuthSnapshot) {
@@ -321,7 +327,7 @@ export class TerminalService {
       await this.createTasks(next);this.ownerSuspended=false;
     }
     await this.activateOwner();
-    if(snapshot.session?.status==='authenticated')this.remote.start();
+    if(snapshot.session?.status==='authenticated' && !this.runtimePaths.executionHost)this.remote.start();
     else this.remote.stop();
   }
   /** A passphrase-protected installation must expose local unlock before any
@@ -337,11 +343,14 @@ export class TerminalService {
       if(!current())return;
       await tasks.unlockSecretServices();if(!current())return;
       await plugins!.start();if(!current())return;
+      // A disposable executor cannot announce readiness while its first catalog
+      // refresh can still invalidate the route of an immediately queued input.
+      if (this.runtimePaths.executionHost) { await this.startGateway(); if (!current()) return; }
       await tasks.resumePending();if(!current())return;
       if(!companionCloud)await companions?.resumePending();if(!current())return;
       await routines?.open();if(!current())return;
       await scheduler.activate();if(!current())return;
-      this.startGateway();
+      if (!this.runtimePaths.executionHost) void this.startGateway();
       void im?.start().catch(()=>{if(current())logger.warn('IM_CONNECTION_START_FAILED');});
     });
     this.ownerActivation=pending;
@@ -350,7 +359,7 @@ export class TerminalService {
   }
   private startGateway() {
     const gateway = this.gateway;
-    void gateway?.start().catch(() => { if (!this.closing && gateway === this.gateway) logger.warn('MODEL_ACCESS_REFRESH_FAILED'); });
+    return gateway?.start().catch(() => { if (!this.closing && gateway === this.gateway) logger.warn('MODEL_ACCESS_REFRESH_FAILED'); });
   }
   /** Account authority is already revoked before this runs. Cleanup failures
    * cannot skip later owners' private sockets, native tasks or durable stores. */
@@ -531,10 +540,10 @@ export class TerminalService {
     });
     this.account=new TerminalRemoteAccountService({getApiBaseUrl:()=>endpoints().deviceLinkApiBaseUrl,getAuthBaseUrl:()=>endpoints().authApiBaseUrl,getToken:async()=>this.auth.getAccessToken(),getOwnerScope:()=>this.auth.snapshot().session?scope():null});
     this.crossShares=new TerminalCrossRegionShares({profileDir:ownerDir,account:this.account,region:this.auth.snapshot().session?.realm??this.region,endpoints:{cn:chinaEndpoints.deviceLinkApiBaseUrl,global:globalEndpoints.deviceLinkApiBaseUrl},getOwnerScope:()=>this.auth.snapshot().session?scope():null,deviceId:this.settings.deviceId,getHello:()=>({deviceName:this.settings.snapshot().effective.deviceName,platform:process.platform,appVersion:VERSION,remoteControlEnabled:false,busy:false}),createWebSocket:(url,headers)=>new WebSocket(url,{headers}),directRuntime:createNodeDirectRtcRuntime(wrtc),onPush:push=>this.transport.publish('terminal:remote-event',[push])});
-    if(this.auth.snapshot().session)void this.crossShares.open().catch(()=>logger.warn('CROSS_REGION_SHARE_UNAVAILABLE'));
+    if(this.auth.snapshot().session && !this.runtimePaths.executionHost)void this.crossShares.open().catch(()=>logger.warn('CROSS_REGION_SHARE_UNAVAILABLE'));
     this.membership=new TerminalMembershipService({account:this.account,getOwnerScope:()=>this.auth.snapshot().session?scope():null,getDeviceId:()=>this.settings.deviceId,isTaskBlocked:id=>this.sharedTasks?.isBlocked(id)??true,externalReceived:()=>this.crossShares.snapshot(),onChanged:()=>this.groupReshare?.kick('memberships'),onRevoked:member=>{const match=(peer:string)=>{const source=parseProviderSharePeer(peer);return source?.role==='guest'&&source.shareId===member.shareId&&source.memberId===member.memberId;};void(member.removed?this.agents.host.purgeControllers(match):this.agents.host.abortControllers(match));if(member.removed)void this.reshares.service.pruneProviderShareReshares(record=>record.shareId===member.shareId&&record.memberId===member.memberId).catch(()=>logger.warn('RESHARE_PRUNE_FAILED'));}});
     this.sharedTasks=new TerminalSharedTasks({database:this.database,ownerAccountId:this.auth.snapshot().session?.membership.id??null,account:this.account,getOwnerScope:()=>this.auth.snapshot().session?scope():null,deviceId:this.settings.deviceId,readTask:id=>this.tasks.storage.get(id),revoke:id=>{for(const peer of this.membership.peersForTask(id))this.remote.revoke(peer);}});
-    if(this.auth.snapshot().session)void this.sharedTasks.open().catch(()=>logger.warn('SHARED_TASK_SYNC_UNAVAILABLE'));
+    if(this.auth.snapshot().session && !this.runtimePaths.executionHost)void this.sharedTasks.open().catch(()=>logger.warn('SHARED_TASK_SYNC_UNAVAILABLE'));
     this.reshares=new TerminalReshares({profileDir:ownerDir,getOwnerScope:scope,guestAccess:peer=>this.membership.guestAccess(peer),changed:()=>this.transport.publish('maker:remote-resources:changed',[{collectionId:'provider-reshares'}]),revoked:records=>{for(const record of records)void this.agents.host.abortReshare(controller=>{const peer=parseProviderSharePeer(controller);return peer?.role==='guest'&&peer.shareId===record.shareId&&peer.memberId===record.memberId&&peer.deviceId===record.deviceId;},record.key);}});
     await this.reshares.open();
     const invokeAgent=(deviceId:string,channel:string,args:unknown[])=>this.invokeRemoteResult(deviceId,channel,args);
@@ -682,7 +691,9 @@ export class TerminalService {
     registerRemoteManagementResources(this.resources.registry,{agent:this.agents,groups:this.groups,membership:this.membership,modelGrants:this.modelGrants,account:this.account,deviceId:this.settings.deviceId,apiBaseUrl:()=>endpoints().deviceLinkApiBaseUrl,remoteEnabled:()=>this.settings.snapshot().effective.remoteEnabled});
     registerShareResources(this.resources.registry,{account:this.account,membership:this.membership,cross:this.crossShares,agent:this.agents,grants:this.modelGrants,reshares:this.reshares,sharedTasks:this.sharedTasks,deviceId:this.settings.deviceId,apiBaseUrl:()=>endpoints().deviceLinkApiBaseUrl,listTasks:()=>this.tasks.storage.list()});
     this.ssh.registerResources(this.resources.registry);
-    const binaries=await this.engines.allStatus();
+    // Startup needs executable paths only; version probes belong to explicit
+    // engine status requests and must not delay local control or vault unlock.
+    const binaries=await Promise.all((['claude-code','codex','pi'] as const).map(async kind=>({kind,binary:(await this.engines.resolve(kind))?.binary})));
     await this.tasks.refreshBinaries(Object.fromEntries(binaries.filter(status=>status.binary).map(status=>[status.kind,status.binary!])));
     this.scheduler=new TerminalSchedulerHost({startPaused:true,worktrees,plugins:this.plugins,profileDir:ownerDir,tasks:this.tasks,logger,companions:()=>this.companions, notify:(schedule,run)=>im.notify(schedule,run),
       canDispatch:()=>this.ownerKey===owner&&this.ownerGeneration===generation&&!this.ownerSuspended&&!this.closing,

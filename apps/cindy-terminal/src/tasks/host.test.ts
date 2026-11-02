@@ -3382,9 +3382,20 @@ describe('terminal task host', () => {
 
   // Integration: the one-shot test cannot detect an old deadline closing a new
   // turn, loss of paused input at timer expiry, or a timer surviving host shutdown.
+  // VPS regression: every production task has a plugin tool bridge; that is not
+  // plugin ownership. Exercise the real plugin assembly and durable CLI queue,
+  // absent from the old timer fixture, while retaining plugin-owned tasks.
   // Real host/SQLite/native boundary with virtual time; no wall-clock idle wait.
   it('reclaims Codex after a fresh idle period and preserves queued work at timer expiry', async () => {
-    const {host,root,native}=await setup();
+    const {host,root,native,vault}=await setup();
+    const account=new TerminalPluginAccount({endpoints:()=>({authApiBaseUrl:'https://auth.example.invalid',pluginApiBaseUrl:'https://plugins.example.invalid'}),membership:()=>null,token:()=>null,refresh:async()=>{},assertCurrent:()=>{}});
+    const plugins=new TerminalPlugins({root,runtimeDirectory:root,executablePath:'unused',account,models:{models:host.models,utility:host.utility},assertCurrent:()=>{},locale:()=> 'en',changed:()=>{},receive:async()=>({}),
+      secrets:{get:async key=>vault.get(key)??null,set:async(key,value)=>{vault.set(key,value);},delete:async key=>{vault.delete(key);},getSync:key=>vault.get(key)??null,setSync:(key,value)=>{vault.set(key,value);},deleteSync:key=>{vault.delete(key);},setManySync:entries=>{for(const [key,value] of Object.entries(entries))if(value===null)vault.delete(key);else vault.set(key,value);}},
+      cards:{persist:async()=>{},broadcast:()=>{}},fs:{getSessionSnapshot:async()=>null,requestWriteConfirm:async()=>({confirmed:false,reason:'cancelled'}),writeSaveDeposit:async()=>null},
+    });
+    const market=new TerminalPluginMarket({root,host:plugins,account,assertCurrent:()=>{}});
+    const pluginTasks=new TerminalPluginTasks({root,runtimeDirectory:root,host:plugins,account,market,tasks:host,protectedInput:{configurePlugins:()=>{}},deposits:new DirDepositVault(),saves:new SaveDepositVault(),owner:()=>({mode:'local',dataOwnerId:'test',generation:1}),signedIn:()=>false,remoteAvailable:()=>false,locale:()=> 'en',assertCurrent:()=>{},emit:()=>{}});
+    await plugins.ready;await pluginTasks.ready;
     await host.models.saveProvider({id:'timer-codex',name:'Timer Codex',auth:{method:'apiKey'},runtimes:{codex:{
       baseUrl:'http://127.0.0.1:1',models:[{id:'idle-model',name:'Idle model'}],
     }}},{codex:'invalid-test-key-only'},true);
@@ -3392,8 +3403,8 @@ describe('terminal task host', () => {
     const client={invoke:(channel:string,args:unknown[]=[])=>host.invoke(channel,args)} as TerminalClient;
     const reclaim=vi.spyOn(host,'reclaimIdleCodexTask');
     const send=async(id:string)=>{
-      await host.invoke('maker:send',[task.id,{text:id,clientId:id}]);
-      await vi.waitFor(async()=>expect(await host.invoke('terminal:tasks:turn-status',[task.id,id]),id).toMatchObject({status:'completed'}),{interval:5});
+      await enqueueMessage(client,task.id,id,id);
+      expect(await waitForTurn(client,task.id,id)).toMatchObject({status:'completed'});
     };
     // Advance idle deadlines only: jumping wall time expires unrelated file
     // leases whose heartbeat still runs on real intervals in this integration.
@@ -3424,10 +3435,13 @@ describe('terminal task host', () => {
       expect(native.starts).toHaveLength(2);
       expect(native.starts[1]).toMatchObject({resumeSessionId:sdk});
       expect(native.sentFor(task.id)).toHaveLength(3);
+      await host.storage.update(task.id,{source:'plugin'});
+      expect(await host.reclaimIdleCodexTask(task.id)).toBe(false);
+      expect(native.teardowns).toHaveLength(1);
       await host.close();
       await vi.advanceTimersByTimeAsync(600_000);
-      expect(reclaim).toHaveBeenCalledTimes(2);
-    } finally {vi.useRealTimers();}
+      expect(reclaim).toHaveBeenCalledTimes(3);
+    } finally {vi.useRealTimers();await host.close();await pluginTasks.close();await plugins.close();}
   });
 
   // Integration: channel takeover must reuse the GUI/TUI task runtime, expose
@@ -4151,6 +4165,29 @@ describe('terminal task host', () => {
       expect((await host.models.select({agentKind:'codex',providerId:'chatfixture',model:'test-model'})).selection.model).toBe('test-model');
 
     } finally { await proxy?.close(); await claudeProxy?.close(); await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
+  // Integration: VPS Codex persisted commentary before tool completion. Existing
+  // queue coverage had only one final reply; waitForTurn must not return that
+  // commentary, but must settle an explicitly completed turn while still busy.
+  it('waits past persisted commentary and returns only the completed reply', async () => {
+    const {host,native}=await setup();
+    const task=await host.invoke('maker:create-session',[{}]) as {id:string};
+    const client={invoke:(channel:string,args:unknown[]=[])=>host.invoke(channel,args)} as TerminalClient;
+    await enqueueMessage(client,task.id,'wait-for-steer','commentary-input');
+    await native.waitForHeld(task.id);
+    const conversations=await host.conversations;
+    await conversations.messages.createMessage(task.id,{clientId:'progress',role:'assistant',content:'I will run the tool',agentMeta:{assistantPhase:'commentary'}});
+    const controller=new AbortController();
+    const observingClient={invoke:async(channel:string,args:unknown[]=[])=>{
+      const result=await host.invoke(channel,args);
+      if(channel==='maker:get-pending-interactions')controller.abort();
+      return result;
+    }} as TerminalClient;
+    expect(await waitForTurn(observingClient,task.id,'commentary-input',{signal:controller.signal})).toMatchObject({status:'detached',errorCode:'WAIT_CANCELLED'});
+    await conversations.messages.createMessage(task.id,{clientId:'final',role:'assistant',content:'TOOLS_OK',agentMeta:{assistantPhase:'final_answer',turnCompleted:true}});
+    expect(await waitForTurn(client,task.id,'commentary-input')).toMatchObject({status:'completed',finalText:'TOOLS_OK'});
+    native.finishHeld(task.id);
   });
 
   it('accepts the production queue client and restores original SQLite queue ownership with attachments', async () => {
