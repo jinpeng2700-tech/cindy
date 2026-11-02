@@ -208,3 +208,65 @@ Chat Server 的 message.created 接入共享通知消费者，Desktop 注入上�
 接回群聊运行时迁移遗漏的四项行为：讨论安排的较早回答限制为 600 字、最新回答保留至 2000 字；负责人安排未完成时同步拒绝新消息（`PLAN_OPEN`）；默认负责人投影为本机伙伴 ID；通知深链显式标注 `conversationKind: 'direct'` 后可读取直接会话、发送回复和推进读位。直接会话即使已预热，普通群入口仍只读快照并拒绝读取群消息或安排。
 
 既有 `chatServer.test.ts` 定向运行 367 项通过（9.53 秒，收集 6.89 秒、执行 2.08 秒）；用例覆盖旧回答截断、安排期间拒绝新消息、负责人 ID 投影、直接通知读取／回复／已读，以及预热直接会话仍拒绝普通群入口。`@cindy/app-runtime`、`@cindy/companion-core`、`@cindy/remote-agent` 与 `cindy-terminal` 类型检查通过；`git diff --check` 通过。Desktop 整包类型检查已执行但失败，报告仍有多处跨模块接口迁移差异；本轮未运行完整 Desktop CI，PR 仍与主干冲突并保持草稿，本轮未部署或修改 VPS。
+
+### 固定精简基线的启动超时修复（2026-11-02）
+
+用户暂停上游整合，基于 `eabb350e74` 在独立工作区继续验证，保留 Codex、Claude Code、Pi。Linux 的任务标签重启持久化与锁定 vault 恢复测试均复现 5 秒超时。临时分段测量确认：请求只需毫秒、关闭约几十毫秒，启动中的 `EngineManager.allStatus()` 却消耗约 3 秒；它为只需要可执行路径的宿主启动额外执行三个引擎的 `--version`，重启时再次执行。临时诊断已移除。
+
+启动改用现有 `resolve()` 解析全部三种引擎，保持 managed/PATH 查找顺序；显式引擎列表、刷新和安装仍沿用原有版本检查。没有关闭引擎、改变登录、vault 加密、持久化格式或远程协议。故障范围为当前 Terminal 服务初始化；不重建设备连接或重放用户请求。
+
+回归并入已有 `host.integration.test.ts` 的真实服务重启用例：临时 PATH 中三个可执行 fixture 记录执行，断言启动和重启不执行引擎，同时标签仍持久化，显式列表返回三种引擎路径和版本并触发查询。旧实现先因出现执行记录失败；修复后通过，不改原 Linux 5 秒限制。测试属于原有 integration tier，无新增文件、真实等待或逐例模块重载。Windows 实跑还暴露 `.cmd` 入口的既有重复转义：`nativeCommand` 已为 cmd.exe 构造命令，Node 又添加反斜杠引号，导致版本查询返回 null。仅对 Windows cmd/bat 入口启用 `windowsVerbatimArguments`，保留原有参数校验、环境隔离与无 shell 模式；真实临时 cmd fixture 验证失败转通过。
+
+验证：Linux 宿主整文件 19 passed、1 Windows 专用 skipped，44.75 秒（收集 37.06 秒、执行 7.17 秒）；此前两项分别 552ms 和 1038ms。Windows 定向宿主与引擎用例 10 passed、24 未执行，47.64 秒（收集 41.16 秒、执行 5.74 秒）；两项宿主分别 3517ms 和 2155ms。Linux 引擎管理全文件 14 passed，2.76 秒。存量宿主集成文件的模块收集超过单测预算，未通过增加 timeout 掩盖。Terminal 类型检查（Linux 启动修复、Windows 最终版本）、test-hygiene（349 files within baseline）和 diff 检查通过。
+
+中国大陆版构建与独立包的原生依赖、help/version、五种 PTY 断线退出及后台存活 smoke 通过；实际供应商和在线 VPS 尚未验收。本轮没有重新运行此前三引擎的全部真实模型 fixture，也没有恢复上游合并或声称完整 CI 通过。
+
+### 固定精简版 VPS 实机验收（2026-11-02）
+
+上述最终中国大陆版 Linux x64 包已经本机中转部署到 Debian VPS，SHA256 为 `880210633e3dd568ec01c93cf758c29b803da2b9bc16defc9125b8b57ccca441`。升级前通过宿主安全停止入口确认无运行任务，保留旧程序及仅存服务器的私有 profile 备份。新旧包的 181 个数据库迁移文件逐文件相同。systemd user 服务、账号登录、vault 解锁和设备在线状态正常；未执行整机重启或回退演练。
+
+Codex 0.159.2、Claude Code 2.1.296、Pi 1.0.2 均使用用户明确选择的同一自定义 Responses 供应商和模型。三种引擎首次固定回复、服务重启后原任务重复上次回复均通过，共六轮真实推理；三个原生线程标识哈希保持一致。Claude Code 的协议转换路径通过本次文本调用。凭据通过既有宿主配置入口在服务器内复用，没有进入本地工作区或报告。默认引擎仍为 Codex。
+
+五分钟自动回收未通过：Codex 首轮结束约 301、323、352 秒时原进程仍在。宿主不忙，任务为普通 desktop 来源并有用户发送时间和原生线程；本轮尚未定位是计时还是资格判断问题。不能将真实线程恢复成功或先前虚拟计时测试解释为本次自动回收成功。
+
+systemd 进程树三引擎同时保留时 PSS 约 1122 MiB、10 秒 CPU 窗口约单核 0.42%；重启续接后显式关闭本次三个测试运行时，只剩宿主 Node，PSS 约 580 MiB。后者紧随关闭操作的 CPU 窗口约 1.66%，不能代表稳定空闲。历史保留；不同进程组成的采样不能用于计算版本降幅。实际手机/桌面控制、真实工具与权限交互、长期资源观测、完整 CI 仍未验收，上游整合继续暂停。
+
+### 正式插件装配下的 Codex 自动回收修复（2026-11-02）
+
+上述五分钟回收失败已定位并修复。正式宿主通过 `TerminalPluginTasks` 给每个任务安装插件工具接口，普通任务也有 `task.plugin`；调度与实际回收却将其误当成插件拥有该任务，因此从未启动计时。删除这两处错误排除，继续使用已有 `row.source` 与生命周期字段判断归属；插件创建的任务仍排除，审批、队列、后台工作和专用运行时的保护保持。不修改插件沙箱、批准状态、权限或发现协议，Claude Code、Pi 的生命周期保持原样。
+
+已有计时集成用例改为真实插件装配和 CLI 持久化输入队列；旧实现先红（回收调用为 0），修复后绿，并覆盖原线程冷恢复、排队时拒绝回收、插件来源排除和宿主关闭后取消计时。Windows 定向 6 passed、119 未执行，63.69 秒（收集 42.51 秒、测试 20.74 秒，计时用例 2427ms）；Linux 同组 6 passed、119 未执行，51.55 秒（收集 40.57 秒、测试 10.39 秒，计时用例 1793ms）。该存量集成文件加载真实 SQLite、MCP 与插件装配，未放宽超时。两端 Terminal 类型检查、test-hygiene（349 files within baseline）及 diff 检查通过。
+
+大陆版 Linux x64 独立包构建和原生依赖/help/version smoke 通过；包 SHA256 为 `ae533fb687140042fd78bef4837fac0bb8c8b8a39644afb4ed339b52c52a2aa4`。包经本机中转上线并保留旧程序和停机数据备份，新旧迁移文件仍相同。真实供应商回复完成后未主动关闭或重启：286.1 秒原 Codex 仍在，301.1 秒采样已消失，符合五分钟计时；进程组 PSS 从 662.4 MiB 降至 507.9 MiB，差约 154.5 MiB。冷恢复到完整回复为 4.55 秒，旧进程已退出、原生线程标识保持、上次回复可正确重复。采样间隔 15 秒，不能将观测时刻当精确退出时刻。
+
+验收后显式关闭本次恢复出的测试运行时并保留历史，最终只有宿主 Node，PSS 约 506 MiB、10 秒 CPU 窗口约单核 0.65%；不将短样本当作长期资源保证。账号、systemd 和三引擎供应商配置保持；Claude Code/Pi 的真实推理沿用上一轮结果，本轮未重复。源码尚未提交推送；上游整合、完整 CI、真实控制端与工具执行仍未完成。
+
+### 三引擎工具与 Desktop 远控验收（2026-11-02）
+
+Codex、Claude Code、Pi 均在 VPS 的独立测试目录执行 Python，读取随机输入、计算求和及 SHA256、写入结果，再通过 shell 或文件工具读回。独立脚本核验结果、cwd、UID 1001 与 Linux 平台，三者均返回 `TOOLS_OK`。实际工具分别为 Codex `exec`、Claude Code `Bash`/`Read`、Pi `bash`/`read`。Pi 与 Claude Code 的 Bash 请求经核对后逐次批准，未更改全局权限；Claude 首条命令有引号错误，收到执行错误后自行修正并完成。测试驱动已区分 CLI 的 `waiting` 与引擎失败，并以持久化完成标记核验结果。
+
+本机 Desktop 0.1.121 中国大陆版通过界面向 VPS 的既有 Claude Code 测试任务发送固定回复请求，界面收到 `DESKTOP_VPS_OK_20261102`。VPS 历史同时确认原输入、来自本机 Desktop 的来源元数据、对应输入的完成回复；不是仅用 SSH 模拟远程控制。真实手机仍未验证。
+
+工具测试还发现 CLI `waitForTurn` 只要读到 assistant 行就返回完成，Codex 的工具前 commentary 因而被误当最终结果。修复排除 commentary/流式行，优先采用 `turnCompleted`，缺少完成元数据的旧宿主仅在空闲时采用兼容结果；保持原有请求关联、排队、错误和审批入口，不重发消息、不扩大超时或改变 wire 协议。
+
+回归并入已有 `tasks/host.test.ts`，通过真实队列与 SQLite 历史，验证 commentary 后仍等待、已有完成标记时即使宿主忙碌也能返回正确最终回复。旧代码先红（错误返回 completed），修复后通过。Windows 同组 4 passed、122 未运行，55.45 秒，其中新增用例 1776ms；Linux 同组 4 passed、122 未运行，43.71 秒，其中新增用例 469ms。存量集成文件模块收集约 38–44 秒，未放宽超时。两端 Terminal 类型检查、test-hygiene（349 files within baseline）、文档合同 10 项、diff 检查和 Linux 独立包构建 smoke 通过。
+
+修复包 SHA256 为 `faa147cbb6523cc9067ed54bf80c60b0eaed1f9fb33413534ae98c253ceeb7dc`，已于北京时间 05:06:55 经本机中转部署；升级前确认宿主空闲并走安全停止入口，旧程序及停机 profile 备份仅留 VPS，新旧 181 个数据库迁移文件相同。账号、vault 和设备连接正常。新 CLI 再次向原 Codex 测试任务发送“先报告进度、执行工具、最后固定回复”，实际产生一条 commentary 和一次工具调用，CLI 等到完成才返回纯 `WAIT_FINAL_OK`，约 9.02 秒（含 CLI 与历史核验）。本次没有重跑五分钟回收实测、完整 CI 或恢复上游整合，源码仍未提交推送。
+
+收尾仅关闭本次四个测试运行时并保留历史。最终服务在线、空闲，进程组只剩 Node，PSS 约 510.1 MiB；10 秒 CPU 窗口约单核 0.66%，不代表长时间稳定资源占用。三引擎工具、Desktop 远控已验证；手机控制、整机重启自启动、长时资源观测与回退演练仍未验证。
+
+### Node 轻量常驻原型（2026-11-02）
+
+新增独立 opt-in 的 lite-resident / lite-execution / lite-executor 与构建脚本。常驻进程保留认证、原 Device Link relay、本地 CLI socket 和有界只读缓存；原 TerminalService 与三引擎放入按需 fork 的执行进程，距最近唤醒或非只读请求至少30秒，且已无运行、审批、排队工作后刷新缓存并正常退出。缓存缺失会重新加载原宿主，写操作清缓存；只读 UNSUPPORTED_CHANNEL 做负缓存，避免 Desktop 轮询反复唤醒。父进程唯一写 vault，子进程沿用只读加密凭据库；短期 access token 走本机私有 IPC，不传 refresh token。默认正式服务入口不切换，数据库 migration、服务端与远程 wire 协议未改。
+
+VPS 实测统计整个原型 systemd cgroup 的 smaps_rollup，单位 MiB：初始历史读取后 PSS/RSS 为81.68/84.21，Codex 后88.08/90.60，Claude Code 后89.37/91.90，Pi 后91.16/93.69，最终重复采样仍为91.16/93.69。每项都只剩同一个常驻 Node、executorPid=null、online、busy=false，且保留实际 Desktop 控制端连接；未强制 GC、限制内存或每项重启常驻。最终两次十秒 CPU 样本约单核0.0087%和0.0092%；Claude 的2.24%窗口包含回收收尾，不代表稳定空闲。运行峰值未测，100 MiB目标仅指回收后的空闲常驻。本次结果暂不触发 Go 替换方案，不能保证长期运行或任意历史规模都低于目标。
+
+三引擎均在既有专用测试目录真实执行 Python 读取 result.json、打印 nonce_sha256，并分别返回 LITE_CODEX_OK / LITE_CLAUDE_CODE_OK / LITE_PI_OK；对应历史确认工具记录、turnCompleted=true和无待批请求。Claude 首次因 MODEL_CONFIGURATION_CHANGED 留在队列，经原有 retry-last-error 重试同一 clientId 后完成，未重复新增输入；具体竞态来源仍待定位，不能称三种冷启动均一次成功。Codex 冷启动至完成约12.60秒；Pi约13.23秒到权限等待，二者并非纯启动时间或可直接比较的完成耗时。权限仅逐次批准已核对测试命令。
+
+实际 Desktop 的 messages:view（7次）与 history:query（4次）等读取没有渠道失败记录。另经本地 CLI 复读已缓存 Pi 历史，读取到本轮完成回复，执行进程累计启动数保持4且前后均为空，验证冷态缓存不唤醒。此项不能代替 Desktop UI；本轮截图黑屏，未完成原型可视验收。旧宿主不支持的 sidebar aliases 仍返回明确错误，不伪装成功。
+
+真实 fork/IPC 回归并入既有 host.integration.test.ts，覆盖回收后读取、写后失效、忙碌拒绝关闭、撤权和不支持渠道负缓存。Windows最终定向1项通过（执行131ms，总43.47秒），Linux最终1项通过（执行100ms，总36.40秒，收集35.80秒）；已有巨型集成文件导入成本超过五秒预算，无新增测试文件或放宽timeout。Windows原有启动、标签持久化、锁定vault三项通过（51.46秒）；两端Terminal类型检查、Linux原型构建、test-hygiene349文件和diff检查通过，未运行完整CI。
+
+验收overlay包SHA256：f416e98a1384ed011a05fb3483f9858aac486470838a7d952afee004414b407f。完成后已安全停止临时原型并恢复turnwait稳定服务，确认active、online、busy=false、prototype=null；当前VPS并非低于100 MiB的原型服务。临时unit正常退出后被systemd --collect移除，脚本多余stop返回code5，确认无原型进程后单独启动稳定unit完成恢复。凭据和profile备份仅留VPS，测试历史保留，源码未提交推送。
+
+原型只验同账号远控、历史与按需执行。登录切换、配置写入、跨账号分享及调度/IM/主动伙伴/插件后台生命周期不构成完整生产支持；外部文件变更、异常退出、缓存一致性与更多控制端的长时资源稳定性仍待验证。先解决冷启动配置竞态和缓存/异常退出边界，再考虑正式替换；不恢复上游整合，不把原型结果解释为完整生产版本验收。

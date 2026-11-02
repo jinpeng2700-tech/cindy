@@ -121,12 +121,20 @@ export async function waitForTurn(client: TerminalClient, sessionId: string, req
         const newer = userIndex < 0 ? [] : messages.slice(0, userIndex);
         const nextUserIndex = newer.findLastIndex(item => item.role === 'user');
         const turn = newer.slice(nextUserIndex + 1).reverse();
-        const replies = turn.filter(item => item.role === 'assistant');
+        const replies = turn.filter(item => item.role === 'assistant'
+          && !item.isStreaming && !item.is_streaming
+          && object(item.agentMeta ?? item.agent_meta).assistantPhase !== 'commentary');
+        const completed = replies.filter(item => object(item.agentMeta ?? item.agent_meta).turnCompleted === true);
+        // Accepted input and a persisted text block do not mean the tool run
+        // has finished. Prefer the host's durable terminal boundary; old hosts
+        // without that metadata can settle only after the session becomes idle.
+        const finalReplies = completed.length ? completed : !running
+          ? replies.filter(item => object(item.agentMeta ?? item.agent_meta).turnCompleted === undefined) : [];
         const failed = turn.some(item => item.role === 'error' || object(item.agentMeta ?? item.agent_meta).error);
         // A host may acknowledge before the agent starts. Absence of a reply
         // cannot be reported as success, even when the busy flag is false.
-        if (failed || replies.length) {
-          return { sessionId, requestId, status: failed ? 'failed' : 'completed', finalText: replies.map(item => messageText(item.content)).join('\n'), ...(failed ? { errorCode: 'TURN_FAILED' } : {}) };
+        if (failed || finalReplies.length) {
+          return { sessionId, requestId, status: failed ? 'failed' : 'completed', finalText: finalReplies.map(item => messageText(item.content)).join('\n'), ...(failed ? { errorCode: 'TURN_FAILED' } : {}) };
         }
         if (userIndex >= 0 && projection.error) {
           return { sessionId, requestId, status: 'failed', errorCode: 'TURN_FAILED' };

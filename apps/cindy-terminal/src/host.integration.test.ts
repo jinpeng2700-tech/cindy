@@ -31,6 +31,7 @@ import { TerminalMediaTransfer } from './media-transfer.js';
 import { TerminalSecretStore } from './secrets.js';
 import { TerminalTransportServer, connectTerminal } from './transport.js';
 import { TerminalService } from './service.js';
+import { LiteExecution } from './lite-execution.js';
 import { socketPath, privateDirectory, windowsSystemCommand, windowsPowerShellEnv } from './platform.js';
 import { TerminalProtectedInput } from './protected-input.js';
 import { TerminalConfiguration } from './configuration.js';
@@ -55,6 +56,49 @@ import { createRemoteFileCache } from '@cindy/app-runtime/remoteFileCache';
 import { createSshMedia } from '@cindy/app-runtime/sshMedia';
 import { TerminalFileBrowser } from './file-browser.js';
 import { buildRemoteMediaUrl } from '@cindy/maker-shared/remoteMediaUrl';
+
+// Integration: the opt-in resident must release its child yet retain bounded
+// read projections. No existing lifecycle test covers process exit + cache
+// invalidation. Minimal input: read, recycle, read, mutate, read; busy veto and
+// authority revocation must not silently replay work. Uses actual fork/IPC.
+it('recycles the lite executor while preserving reads and rejecting unsafe shutdown', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cindy-lite-ipc-'));
+  const file = path.join(root, 'executor.mjs');
+  await fs.writeFile(file, `
+    let busy=false,value=0;
+    process.on('message',m=>{
+      if(m.type==='init'){process.send({type:'ready'});return;}
+      if(m.type!=='invoke')return;
+      if(m.channel==='git-context:pr-refs:list'){process.send({type:'result',id:m.id,error:'UNSUPPORTED_CHANNEL'});return;}
+      if(m.channel==='lite:drain'){process.send({type:'result',id:m.id,value:{closed:true}},()=>process.exit(0));return;}
+      if(m.channel==='write')value++;
+      if(m.channel==='busy')busy=m.args[0];
+      process.send({type:'result',id:m.id,value:m.channel==='terminal:status'?{busy}:{value}});
+    });
+    process.on('disconnect',()=>process.exit(0));
+  `);
+  const pool = new LiteExecution({ file, profile: root, region: 'global', auth: () => ({}), refresh: async () => ({}), push() {}, idleMs: 0 });
+  try {
+    expect(await pool.invoke('terminal:tasks:list', [])).toEqual({ value: 0 });
+    await expect(pool.invoke('git-context:pr-refs:list', [])).rejects.toThrow('UNSUPPORTED_CHANNEL');
+    await pool.idle();
+    expect(pool.state.executorPid).toBeNull();
+    expect(await pool.invoke('terminal:tasks:list', [])).toEqual({ value: 0 });
+    expect(pool.state.starts).toBe(1);
+    await expect(pool.invoke('git-context:pr-refs:list', [])).rejects.toThrow('UNSUPPORTED_CHANNEL');
+    expect(pool.state.starts).toBe(1);
+    await pool.invoke('write', []);
+    expect(await pool.invoke('terminal:tasks:list', [])).toEqual({ value: 1 });
+    await pool.invoke('busy', [true]);
+    await pool.idle();
+    expect(pool.state.executorPid).not.toBeNull();
+    await expect(pool.close()).rejects.toThrow('STOP_RUNNING_TASKS_BEFORE_SERVICE_STOP');
+    await pool.invoke('busy', [false]);
+    await pool.idle();
+    pool.revoke();
+    await expect(pool.invoke('terminal:tasks:list', [])).rejects.toThrow('LITE_RESIDENT_STOPPING');
+  } finally { await pool.close(); await fs.rm(root, { recursive: true, force: true }); }
+});
 
 // Integration: the original media service was absent from the Node host. A
 // configured image connection must execute, persist and recover its real blob;
@@ -445,10 +489,22 @@ describe('terminal private host', () => {
 
   // Integration: original task metadata routes must reach their real DB
   // transactions in a terminal host, including after process recreation.
+  // Startup must resolve all three engines without running version probes:
+  // PATH CLI startup made two host starts exceed this existing test's budget.
+  // Executable fixtures record probes; explicit engine listing must still probe.
   it('persists original GUI task tags through the terminal IPC entry',async()=>{
     const root=path.join(directory,'original-task-tags'),options={worktreeAppDataRoot:path.join(directory,'worktree-app-data')};
     let service=new TerminalService(root,'global',options),client:Awaited<ReturnType<typeof connectTerminal>>|undefined;
+    const originalPath=process.env.PATH,bin=path.join(directory,'tag-test-engines'),probes=path.join(bin,'probes');
     try{
+      await fs.mkdir(bin);
+      for(const name of ['claude','codex','pi']){
+        const script=path.join(bin,`${name}.cjs`);
+        await fs.writeFile(script,`require('node:fs').appendFileSync(${JSON.stringify(probes)},'${name}\\n');process.stdout.write('1.2.3');`);
+        const executable=path.join(bin,process.platform==='win32'?`${name}.cmd`:name);
+        await fs.writeFile(executable,process.platform==='win32'?`@echo off\r\n"${process.execPath}" "${script}"\r\n`:`#!${process.execPath}\nrequire(${JSON.stringify(script)});\n`,{mode:0o700});
+      }
+      process.env.PATH=bin+path.delimiter+(originalPath??'');
       await service.start();client=await connectTerminal(root);
       const created=await client.invoke<{tags:Array<{id:string;name:string;revision:number}>}>('local-db:task-tags:execute',[{action:'create',name:'Fixture tag',color:'blue'}]);
       const tag=created.tags.find(row=>row.name==='Fixture tag');expect(tag).toBeDefined();
@@ -456,7 +512,18 @@ describe('terminal private host', () => {
       service=new TerminalService(root,'global',options);await service.start();client=await connectTerminal(root);
       const result=await client.invoke<{tags:unknown[]}>('local-db:task-tags:execute',[{action:'list'}]);
       expect(result.tags).toContainEqual(tag);
-    }finally{client?.close();await service.close();}
+      await expect(fs.stat(probes)).rejects.toMatchObject({code:'ENOENT'});
+      const engines=await client.invoke<Array<{kind:string;binary:string;version:string}>>('terminal:engines:list');
+      expect(engines.map(engine=>engine.kind).sort()).toEqual(['claude-code','codex','pi']);
+      for(const engine of engines){
+        expect(path.dirname(engine.binary)).toBe(bin);
+        expect(engine.version).toBe('1.2.3');
+      }
+      expect((await fs.readFile(probes,'utf8')).trim().split('\n').sort()).toEqual(['claude','codex','pi']);
+    }finally{
+      if(originalPath===undefined)delete process.env.PATH;else process.env.PATH=originalPath;
+      client?.close();await service.close();
+    }
   },process.platform==='win32'?30_000:5_000);
 
   // First-run/locked-vault regression: a persisted MCP must not prevent the

@@ -4373,7 +4373,7 @@ export class TerminalTaskHost {
     const task = this.live.get(id), row = this.storage.peek(id);
     if (this.closed || !task || task.session.agentKind !== 'codex' || task.session.getStatus() !== 'active' || this.isTurnRunning(id)
       || !row?.userSendAt || row.remoteHostId || row.agentDeviceId || row.groupBinding || row.orcaRole
-      || row.orcaRemoteLead || row.reviewMode || row.parentSessionId || task.plugin
+      || row.orcaRemoteLead || row.reviewMode || row.parentSessionId
       || (row.source && row.source !== 'desktop')) return;
     const current = () => !this.closed && this.idleReclaimTimers.get(id) === timer && this.live.get(id) === task;
     const timer = setTimeout(() => {
@@ -4403,11 +4403,12 @@ export class TerminalTaskHost {
       await this.conversationRuntime.persistence.drainPersistQueue();
       const row = await this.storage.get(id);
       const goal = await this.goals.controller.getStatus(id);
-      // Keep the first experiment away from runtimes owned by another lifecycle.
+      // Ownership is recorded in the task row. Every production task has a
+      // plugin tool bridge, including ordinary desktop tasks eligible for reclaim.
       if (!row?.sdkSessionId || !row.userSendAt || row.agentKind !== 'codex' || row.remoteHostId || row.agentDeviceId
         || row.groupBinding || (row.source && row.source !== 'desktop') || row.orcaRole || row.orcaRemoteLead || row.reviewMode
         || row.parentSessionId || row.pendingHandoff || row.goalContinuation || goal
-        || row.archived || row.deleted || task.plugin) return false;
+        || row.archived || row.deleted) return false;
       const busy = () => this.closed || !stillIdle() || !this.pendingDispatchReady || this.live.get(id) !== task
         || this.closingTasks.has(task) || this.isTurnRunning(id) || this.stoppingTasks.has(id)
         || this.queueMutations.has(id) || this.persistenceFaults.has(id) || !!this.routes.pending.get(id)

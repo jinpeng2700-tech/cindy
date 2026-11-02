@@ -34,7 +34,9 @@ export function nativeCommand(binary: string, args: string[], env: NodeJS.Proces
 export function runNative(binary: string, args: string[], options: { interactive?: boolean; signal?: AbortSignal; env?: NodeJS.ProcessEnv; cwd?: string; timeout?: number; onOutput?: (text: string) => void } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   const command = nativeCommand(binary, args, options.env);
   return new Promise((resolve, reject) => {
-    const settings: SpawnOptions = { env: command.env, cwd: options.cwd, shell: false, windowsHide: !options.interactive, stdio: options.interactive ? 'inherit' : ['ignore', 'pipe', 'pipe'] };
+    // nativeCommand already quotes the cmd.exe command string; Node's normal
+    // argv quoting would turn those quotes into literal backslash-quotes.
+    const settings: SpawnOptions = { env: command.env, cwd: options.cwd, shell: false, windowsVerbatimArguments: process.platform === 'win32' && /\.(cmd|bat)$/i.test(binary), windowsHide: !options.interactive, stdio: options.interactive ? 'inherit' : ['ignore', 'pipe', 'pipe'] };
     const child = spawn(command.command, command.args, settings);
     let stdout = '', stderr = '', finished = false;
     let terminationError: EngineError | undefined, killTimer: NodeJS.Timeout | undefined;
